@@ -1,0 +1,181 @@
+name: Linux Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag or ref to build and release from"
+        required: true
+        type: string
+      release_name:
+        description: "Optional GitHub Release title"
+        required: false
+        type: string
+      draft:
+        description: "Create a draft release"
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark the release as a prerelease"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: Release
+  PACKAGE_ROOT: release-packages
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cpu
+            kind: cpu
+            build_dir: build-cpu
+            package_dir: voxcpm-linux-cpu
+            artifact_name: voxcpm-linux-cpu
+            cmake_args: >-
+              -DVOXCPM_CUDA=OFF
+              -DVOXCPM_BUILD_BENCHMARK=OFF
+              -DVOXCPM_BUILD_TESTS=OFF
+          - name: cuda-sm75
+            kind: cuda
+            build_dir: build-cuda
+            package_dir: voxcpm-linux-cuda-sm75
+            artifact_name: voxcpm-linux-cuda-sm75
+            cmake_args: >-
+              -DVOXCPM_CUDA=ON
+              -DVOXCPM_BUILD_BENCHMARK=OFF
+              -DVOXCPM_BUILD_TESTS=OFF
+              -DCMAKE_CUDA_ARCHITECTURES=75
+          - name: cuda-sm86
+            kind: cuda
+            build_dir: build-cuda
+            package_dir: voxcpm-linux-cuda-sm86
+            artifact_name: voxcpm-linux-cuda-sm86
+            cmake_args: >-
+              -DVOXCPM_CUDA=ON
+              -DVOXCPM_BUILD_BENCHMARK=OFF
+              -DVOXCPM_BUILD_TESTS=OFF
+              -DCMAKE_CUDA_ARCHITECTURES=86
+          - name: cuda-sm89
+            kind: cuda
+            build_dir: build-cuda
+            package_dir: voxcpm-linux-cuda-sm89
+            artifact_name: voxcpm-linux-cuda-sm89
+            cmake_args: >-
+              -DVOXCPM_CUDA=ON
+              -DVOXCPM_BUILD_BENCHMARK=OFF
+              -DVOXCPM_BUILD_TESTS=OFF
+              -DCMAKE_CUDA_ARCHITECTURES=89
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: bluryar/VoxCPM.cpp
+          submodules: recursive
+
+      - name: Set up CUDA toolkit
+        if: matrix.kind == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            build-essential \
+            ninja-build \
+            git \
+            pkg-config \
+            tar \
+            gzip \
+            nlohmann-json3-dev
+
+      - name: Configure
+        run: >
+          cmake -B "${{ matrix.build_dir }}"
+          -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+          ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build "${{ matrix.build_dir }}"
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+
+          package_dir="${PACKAGE_ROOT}/${{ matrix.package_dir }}"
+          mkdir -p "${package_dir}/bin"
+
+          cmake --install "${{ matrix.build_dir }}" --prefix "${package_dir}"
+
+          install -Dm755 "${{ matrix.build_dir }}/examples/voxcpm_tts" "${package_dir}/bin/voxcpm_tts"
+          install -Dm755 "${{ matrix.build_dir }}/examples/voxcpm_quantize" "${package_dir}/bin/voxcpm_quantize"
+          install -Dm755 "${{ matrix.build_dir }}/examples/voxcpm_imatrix" "${package_dir}/bin/voxcpm_imatrix"
+          install -Dm755 "${{ matrix.build_dir }}/examples/voxcpm-server" "${package_dir}/bin/voxcpm-server"
+
+          tar -C "${PACKAGE_ROOT}" -czf "${{ matrix.artifact_name }}-${{ inputs.tag_name }}.tar.gz" "${{ matrix.package_dir }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}-${{ inputs.tag_name }}
+          path: ${{ matrix.artifact_name }}-${{ inputs.tag_name }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: voxcpm-linux-*-${{ inputs.tag_name }}
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_RELEASE_NAME: ${{ inputs.release_name }}
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_RELEASE_NAME}" ]; then
+            release_name="${INPUT_RELEASE_NAME}"
+          else
+            release_name="VoxCPM ${INPUT_TAG_NAME}"
+          fi
+
+          {
+            echo "release_name=${release_name}"
+            echo "tag_name=${INPUT_TAG_NAME}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: ${{ steps.meta.outputs.release_name }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
